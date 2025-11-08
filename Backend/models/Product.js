@@ -75,84 +75,86 @@ const Product = {
     search: async ({ q, minPrice, maxPrice, category }) => {
         let query = `
             SELECT 
-            p.*, 
-            u.name AS seller_name, 
-            u.email AS seller_email,
-            CASE 
-                WHEN $1::text IS NULL OR $1 = '' THEN NULL
-                ELSE ts_rank(
-                setweight(to_tsvector('english', coalesce(p.name, '')), 'A') ||
-                setweight(to_tsvector('english', coalesce(p.description, '')), 'B') ||
-                setweight(to_tsvector('english', coalesce(p.category_text, '')), 'C'),
-                websearch_to_tsquery('english', $1)
-                )
-            END AS rank,
-            CASE 
-                WHEN $1::text IS NULL OR $1 = '' THEN 0
-                ELSE GREATEST(
-                similarity(p.name, $1),
-                similarity(p.description, $1),
-                similarity(p.category_text, $1)
-                )
-            END AS sim
+                p.*, 
+                u.name AS seller_name, 
+                u.email AS seller_email,
+                CASE 
+                    WHEN $1::text IS NULL OR $1 = '' THEN 0
+                    ELSE ts_rank(
+                        setweight(to_tsvector('english', coalesce(p.name, '')), 'A') ||
+                        setweight(to_tsvector('english', coalesce(p.description, '')), 'B') ||
+                        setweight(to_tsvector('english', coalesce(p.category_text, '')), 'C'),
+                    websearch_to_tsquery('english', $1)
+                    )
+                END AS rank,
+                CASE 
+                    WHEN $1::text IS NULL OR $1 = '' THEN 0
+                    ELSE GREATEST(
+                        word_similarity(p.name, $1),
+                        word_similarity(p.description, $1),
+                        word_similarity(p.category_text, $1)
+                    )
+                END AS sim
             FROM products p
             JOIN users u ON p.seller_id = u.id
             WHERE 1=1
         `;
-
+    
         const params = [q || ''];
         let idx = 2;
-
-        // --- Apply search query (text or fuzzy) ---
+    
         if (q && q.trim()) {
             query += `
             AND (
+                -- Full Text Search
                 (
-                (setweight(to_tsvector('english', coalesce(p.name, '')), 'A') ||
-                setweight(to_tsvector('english', coalesce(p.description, '')), 'B') ||
-                setweight(to_tsvector('english', coalesce(p.category_text, '')), 'C'))
-                @@ websearch_to_tsquery('english', $1)
+                    (setweight(to_tsvector('english', coalesce(p.name, '')), 'A') ||
+                    setweight(to_tsvector('english', coalesce(p.description, '')), 'B') ||
+                    setweight(to_tsvector('english', coalesce(p.category_text, '')), 'C'))
+                    @@ websearch_to_tsquery('english', $1)
                 )
+    
+                -- Fuzzy Search (typos & similar words)
+                OR word_similarity(p.name, $1) > 0.2
+                OR word_similarity(p.description, $1) > 0.2
+                OR word_similarity(p.category_text, $1) > 0.2
+    
+                -- Prefix + Partial Matches
+                OR p.name ILIKE $1 || '%'
                 OR p.name ILIKE '%' || $1 || '%'
                 OR p.description ILIKE '%' || $1 || '%'
                 OR p.category_text ILIKE '%' || $1 || '%'
-                OR similarity(p.name, $1) > 0.3
-                OR similarity(p.description, $1) > 0.3
-                OR similarity(p.category_text, $1) > 0.3
             )
             `;
         }
-
-        // --- Price filters ---
+    
         if (minPrice != null) {
             query += ` AND p.price >= $${idx}`;
             params.push(minPrice);
             idx++;
         }
-
+    
         if (maxPrice != null) {
             query += ` AND p.price <= $${idx}`;
             params.push(maxPrice);
             idx++;
         }
-
-        // --- Category filter ---
+    
         if (category) {
             query += ` AND p.category_text ILIKE '%' || $${idx} || '%'`;
             params.push(category);
             idx++;
         }
-
-        // --- Wrap query for ordering on alias columns ---
+    
         const finalQuery = `
             SELECT * FROM (
-            ${query}
+                ${query}
             ) AS sub
             ${q && q.trim()
-            ? 'ORDER BY (COALESCE(rank, 0) + COALESCE(sim, 0)) DESC, updated_at DESC'
-            : 'ORDER BY updated_at DESC'};
+                ? 'ORDER BY (COALESCE(rank, 0) + COALESCE(sim, 0) * 2) DESC, updated_at DESC'
+                : 'ORDER BY updated_at DESC'};
         `;
-
+    
         const result = await pool.query(finalQuery, params);
         
         return result.rows;
